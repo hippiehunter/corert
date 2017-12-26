@@ -108,6 +108,26 @@ internal static class Program
         {
             PrintLine("SwitchOpDefault test: Ok.");
         }
+
+        Func<int> staticDelegate = StaticDelegateTarget;
+        if(staticDelegate() == 7)
+        {
+            PrintLine("Static delegate test: Ok.");
+        }
+
+        tempObj.TestInt = 8;
+        Func<int> instanceDelegate = tempObj.InstanceDelegateTarget;
+        if(instanceDelegate() == 8)
+        {
+            PrintLine("Instance delegate test: Ok.");
+        }
+
+        PrintLine("Done");
+    }
+
+    private static int StaticDelegateTarget()
+    {
+        return 7;
     }
 
     private static unsafe void PrintString(string s)
@@ -198,7 +218,8 @@ public struct BoxStubTest
 
 public class TestClass
 {
-    public string TestString {get; set;}
+    public string TestString { get; set; }
+    public int TestInt { get; set; }
 
     public TestClass(int number)
     {
@@ -220,6 +241,11 @@ public class TestClass
 	public virtual void TestVirtualMethod2(string str)
     {
         Program.PrintLine("Virtual Slot Test 2: Ok");
+    }
+
+    public int InstanceDelegateTarget()
+    {
+        return TestInt;
     }
 }
 
