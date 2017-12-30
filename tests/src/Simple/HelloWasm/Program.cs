@@ -122,6 +122,14 @@ internal static class Program
             PrintLine("Instance delegate test: Ok.");
         }
 
+        var arrayTest = new BoxStubTest[] { new BoxStubTest { Value = "Hello" }, new BoxStubTest { Value = "Array" }, new BoxStubTest { Value = "Test" } };
+        foreach(var element in arrayTest)
+            PrintLine(element.Value);
+
+        arrayTest[1].Value = "Array load/store test: Ok.";
+        
+        PrintLine(arrayTest[1].Value);
+
         PrintLine("Done");
     }
 
@@ -220,7 +228,6 @@ public class TestClass
 {
     public string TestString { get; set; }
     public int TestInt { get; set; }
-
     public TestClass(int number)
     {
         if(number != 1337)

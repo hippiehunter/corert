@@ -108,6 +108,15 @@ namespace Internal.IL
 
         private static void EmitNativeToManagedThunk(WebAssemblyCodegenCompilation compilation, MethodDesc method, string nativeName, LLVMValueRef managedFunction)
         {
+            if(pinvokeMap.TryGetValue(nativeName, out MethodDesc existantDesc))
+            {
+                method = existantDesc;
+            }
+            else
+            {
+                pinvokeMap.Add(nativeName, existantDesc);
+            }
+
             LLVMTypeRef[] llvmParams = new LLVMTypeRef[method.Signature.Length];
             for (int i = 0; i < llvmParams.Length; i++)
             {
