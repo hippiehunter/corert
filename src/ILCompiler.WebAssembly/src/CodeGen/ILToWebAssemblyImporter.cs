@@ -277,7 +277,7 @@ namespace Internal.IL
             var terminator = basicBlock.Block.GetBasicBlockTerminator();
             if (terminator.Pointer == IntPtr.Zero)
             {
-                if (_basicBlocks.Length > _currentOffset)
+                if (_basicBlocks.Length > (_currentOffset + 1))
                 {
                     if (_basicBlocks[_currentOffset].StartOffset == 0)
                         throw new InvalidProgramException();
@@ -522,6 +522,9 @@ namespace Internal.IL
 
         internal static LLVMValueRef CastIfNecessary(LLVMBuilderRef builder, LLVMValueRef source, LLVMTypeRef valueType)
         {
+            if (source.Pointer == IntPtr.Zero)
+                throw new InvalidProgramException();
+
             LLVMTypeRef sourceType = LLVM.TypeOf(source);
             if (sourceType.Pointer == valueType.Pointer)
                 return source;
@@ -868,11 +871,13 @@ namespace Internal.IL
                 if (!_compilation.HasFixedSlotVTable(callee.OwningType))
                     _dependencies.Add(_compilation.NodeFactory.VirtualMethodUse(callee));
 
-                //TODO: needs runtime support for DispatchByInterface
                 if (callee.OwningType.IsInterface)
-                    throw new NotImplementedException("Interface call");
-
-                return GetCallableVirtualMethod(thisPointer.ValueAsType(LLVM.PointerType(LLVM.Int8Type(), 0), _builder), callee);
+                {
+                    LLVMValueRef interfaceMethod = GetFunctionPointerForInterfaceMethod(callee, thisPointer).RawLLVMValue;
+                    return CastIfNecessary(interfaceMethod, LLVM.PointerType(_universalSignature, 0));
+                }
+                else
+                    return GetCallableVirtualMethod(thisPointer.ValueAsType(LLVM.PointerType(LLVM.Int8Type(), 0), _builder), callee);
             }
             else
             {
@@ -1080,6 +1085,17 @@ namespace Internal.IL
             }
         }
 
+        private LoadExpressionEntry GetFunctionPointerForInterfaceMethod(MethodDesc method, StackEntry v)
+        {
+            TypeDesc EETypeType = _compilation.TypeSystemContext.SystemModule.GetKnownType("Internal.Runtime", "EEType");
+            var arguments = new StackEntry[]
+            {
+                new LoadExpressionEntry(StackValueKind.ValueType, "eeType", v.ValueAsType(LLVM.PointerType(LLVM.PointerType(LLVM.Int8Type(), 0), 0), _builder), EETypeType),
+                new ExpressionEntry(StackValueKind.Int32, "slot", GetOrCreateMethodSlot(method), GetWellKnownType(WellKnownType.UInt16))
+            };
+            return CallRuntime(_compilation.TypeSystemContext, DispatchResolve, "FindInterfaceMethodImplementationTarget", arguments);
+        }
+
         private void AddMethodReference(MethodDesc method)
         {
             _dependencies.Add(_compilation.NodeFactory.MethodEntrypoint(method));
@@ -1147,6 +1163,9 @@ namespace Internal.IL
 
         private LLVMValueRef MakeExternFunction(MethodDesc method, string realMethodName, LLVMValueRef realFunction = default(LLVMValueRef))
         {
+            if (realMethodName == "RhpLockCmpXchg64")
+                throw new NotImplementedException("LLVM Bug");
+
             LLVMValueRef nativeFunc;
             LLVMTypeRef[] paramTypes = new LLVMTypeRef[method.Signature.Length];
             for (int i = 0; i < paramTypes.Length; i++)
@@ -2145,6 +2164,7 @@ namespace Internal.IL
 
         private const string RuntimeExport = "RuntimeExports";
         private const string RuntimeImport = "RuntimeImports";
+        private const string DispatchResolve = "DispatchResolve";
         private LoadExpressionEntry CallRuntime(TypeSystemContext context, string className, string methodName, StackEntry[] arguments, TypeDesc forcedReturnType = null)
         {
             MetadataType helperType = context.SystemModule.GetKnownType("System.Runtime", className);
