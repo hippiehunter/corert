@@ -1092,46 +1092,41 @@ namespace Internal.IL
         static Dictionary<string, MethodDesc> pinvokeMap = new Dictionary<string, MethodDesc>();
         private void ImportRawPInvoke(MethodDesc method)
         {
+            //emscripten dies if this is output because its expected to have i32, i32, i64. But the runtime has defined it as i8*, i8*, i64
+            if (method.Name == "memmove")
+                throw new NotImplementedException();
+
             string realMethodName = method.Name;
             if(!method.IsPInvoke && method is TypeSystem.Ecma.EcmaMethod)
             {
                 realMethodName = ((TypeSystem.Ecma.EcmaMethod)method).GetRuntimeImportName() ?? method.Name;
             }
             MethodDesc existantDesc;
+            LLVMValueRef nativeFunc;
+            LLVMValueRef realNativeFunc = LLVM.GetNamedFunction(Module, realMethodName);
             if (pinvokeMap.TryGetValue(realMethodName, out existantDesc))
             {
-                //if (existantDesc != method)
-                //    throw new NotImplementedException();
-
-                method = existantDesc;
+                if (existantDesc != method)
+                {
+                    // Set up native parameter types
+                    nativeFunc = MakeExternFunction(method, realMethodName, realNativeFunc);
+                }
+                else
+                {
+                    nativeFunc = realNativeFunc;
+                }
             }
             else
             {
                 pinvokeMap.Add(realMethodName, method);
+                nativeFunc = realNativeFunc;
             }
-
-            LLVMValueRef nativeFunc = LLVM.GetNamedFunction(Module, realMethodName);
-
-            //emscripten dies if this is output because its expected to have i32, i32, i64. But the runtime has defined it as i8*, i8*, i64
-            if (method.Name == "memmove")
-                throw new NotImplementedException();
-
 
             // Create an import if we haven't already
             if (nativeFunc.Pointer == IntPtr.Zero)
             {
                 // Set up native parameter types
-                LLVMTypeRef[] paramTypes = new LLVMTypeRef[method.Signature.Length];
-                for (int i = 0; i < paramTypes.Length; i++)
-                {
-                    paramTypes[i] = GetLLVMTypeForTypeDesc(method.Signature[i]);
-                }
-
-                // Define the full signature
-                LLVMTypeRef nativeFuncType = LLVM.FunctionType(GetLLVMTypeForTypeDesc(method.Signature.ReturnType), paramTypes, LLVMMisc.False);
-
-                nativeFunc = LLVM.AddFunction(Module, realMethodName, nativeFuncType);
-                LLVM.SetLinkage(nativeFunc, LLVMLinkage.LLVMDLLImportLinkage);
+                nativeFunc = MakeExternFunction(method, realMethodName);
             }
 
             LLVMValueRef[] arguments = new LLVMValueRef[method.Signature.Length];
@@ -1148,6 +1143,30 @@ namespace Internal.IL
 
             if(!method.Signature.ReturnType.IsVoid)
                 PushExpression(GetStackValueKind(method.Signature.ReturnType), "retval", returnValue, method.Signature.ReturnType);
+        }
+
+        private LLVMValueRef MakeExternFunction(MethodDesc method, string realMethodName, LLVMValueRef realFunction = default(LLVMValueRef))
+        {
+            LLVMValueRef nativeFunc;
+            LLVMTypeRef[] paramTypes = new LLVMTypeRef[method.Signature.Length];
+            for (int i = 0; i < paramTypes.Length; i++)
+            {
+                paramTypes[i] = GetLLVMTypeForTypeDesc(method.Signature[i]);
+            }
+
+            // Define the full signature
+            LLVMTypeRef nativeFuncType = LLVM.FunctionType(GetLLVMTypeForTypeDesc(method.Signature.ReturnType), paramTypes, LLVMMisc.False);
+
+            if (realFunction.Pointer == IntPtr.Zero)
+            {
+                nativeFunc = LLVM.AddFunction(Module, realMethodName, nativeFuncType);
+                LLVM.SetLinkage(nativeFunc, LLVMLinkage.LLVMDLLImportLinkage);
+            }
+            else
+            {
+                nativeFunc = LLVM.BuildPointerCast(_builder, realFunction, LLVM.PointerType(nativeFuncType, 0), realMethodName + "__slot__");
+            }
+            return nativeFunc;
         }
 
         private void ImportCalli(int token)
