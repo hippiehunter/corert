@@ -133,9 +133,10 @@ namespace Internal.IL
         private void GenerateProlog()
         {
             int totalLocalSize = 0;
+            var pointerSize = _compilation.NodeFactory.Target.PointerSize;
             foreach(LocalVariableDefinition local in _locals)
             {
-                int localSize = local.Type.GetElementSize().AsInt;
+                int localSize = local.Type.GetElementSize().AsInt.AlignUp(pointerSize);
                 totalLocalSize += localSize;
             }
 
@@ -651,30 +652,33 @@ namespace Internal.IL
 
         private int GetTotalLocalOffset()
         {
+            var alignment = _compilation.TypeSystemContext.Target.PointerSize;
             int offset = GetTotalRealLocalOffset();
             for (int i = 0; i < _spilledExpressions.Count; i++)
             {
-                offset += _spilledExpressions[i].Type.GetElementSize().AsInt;
+                offset += _spilledExpressions[i].Type.GetElementSize().AsInt.AlignUp(alignment);
             }
             return offset;
         }
 
         private int GetTotalRealLocalOffset()
         {
+            var alignment = _compilation.TypeSystemContext.Target.PointerSize;
             int offset = 0;
             for (int i = 0; i < _locals.Length; i++)
             {
-                offset += _locals[i].Type.GetElementSize().AsInt;
+                offset += _locals[i].Type.GetElementSize().AsInt.AlignUp(alignment);
             }
             return offset;
         }
 
         private int GetTotalParameterOffset()
         {
+            var alignment = _compilation.TypeSystemContext.Target.PointerSize;
             int offset = 0;
             for (int i = 0; i < _signature.Length; i++)
             {
-                offset += _signature[i].GetElementSize().AsInt;
+                offset += _signature[i].GetElementSize().AsInt.AlignUp(alignment);
             }
             if (!_signature.IsStatic)
             {
@@ -685,7 +689,7 @@ namespace Internal.IL
                 }
                 else
                 {
-                    offset += _thisType.GetElementSize().AsInt;
+                    offset += _thisType.GetElementSize().AsInt.AlignUp(alignment);
                 }
             }
 
@@ -694,10 +698,11 @@ namespace Internal.IL
 
         private void GetArgSizeAndOffsetAtIndex(int index, out int size, out int offset)
         {
+            var alignment = _compilation.TypeSystemContext.Target.PointerSize;
             int thisSize = 0;
             if (!_signature.IsStatic)
             {
-                thisSize = _thisType.IsValueType ? _thisType.Context.Target.PointerSize : _thisType.GetElementSize().AsInt;
+                thisSize = _thisType.IsValueType ? _thisType.Context.Target.PointerSize : _thisType.GetElementSize().AsInt.AlignUp(alignment);
                 if (index == 0)
                 {
                     size = thisSize;
@@ -716,7 +721,7 @@ namespace Internal.IL
             offset = thisSize;
             for (int i = 0; i < index; i++)
             {
-                offset += _signature[i].GetElementSize().AsInt;
+                offset += _signature[i].GetElementSize().AsInt.AlignUp(alignment);
             }
         }
 
@@ -724,23 +729,23 @@ namespace Internal.IL
         {
             LocalVariableDefinition local = _locals[index];
             size = local.Type.GetElementSize().AsInt;
-
+            var alignment = _compilation.TypeSystemContext.Target.PointerSize;
             offset = 0;
             for (int i = 0; i < index; i++)
             {
-                offset += _locals[i].Type.GetElementSize().AsInt;
+                offset += _locals[i].Type.GetElementSize().AsInt.AlignUp(alignment);
             }
         }
 
         private void GetSpillSizeAndOffsetAtIndex(int index, out int size, out int offset)
         {
             SpilledExpressionEntry spill = _spilledExpressions[index];
+            var alignment = _compilation.TypeSystemContext.Target.PointerSize;
             size = spill.Type.GetElementSize().AsInt;
-
             offset = 0;
             for (int i = 0; i < index; i++)
             {
-                offset += _spilledExpressions[i].Type.GetElementSize().AsInt;
+                offset += _spilledExpressions[i].Type.GetElementSize().AsInt.AlignUp(alignment);
             }
         }
 
@@ -907,9 +912,8 @@ namespace Internal.IL
         {
             MetadataType metadataType = (MetadataType)type;
             var eeTypeDesc = _compilation.TypeSystemContext.SystemModule.GetKnownType("System", "EETypePtr");
-            PushLoadExpression(StackValueKind.ByRef, "eeType", GetEETypePointerForTypeDesc(metadataType, true), eeTypeDesc);
-            CallRuntimeExport(_compilation.TypeSystemContext, "RhNewObject", type);
-            return _stack.Pop() as ExpressionEntry;
+            var arguments = new StackEntry[] { new LoadExpressionEntry(StackValueKind.ByRef, "eeType", GetEETypePointerForTypeDesc(metadataType, true), eeTypeDesc) };
+            return CallRuntime(_compilation.TypeSystemContext, RuntimeExport, "RhNewObject", arguments, type);
         }
 
         private static LLVMValueRef BuildConstInt1(int number)
@@ -980,7 +984,23 @@ namespace Internal.IL
             return false;
         }
 
-        private void HandleCall(MethodDesc callee, MethodSignature signature, ILOpcode opcode = ILOpcode.call, LLVMValueRef calliTarget = default(LLVMValueRef), TypeDesc forcedReturnType = null)
+        private void HandleCall(MethodDesc callee, MethodSignature signature, ILOpcode opcode = ILOpcode.call, LLVMValueRef calliTarget = default(LLVMValueRef))
+        {
+            var parameterCount = signature.Length + (signature.IsStatic ? 0 : 1);
+            // The last argument is the top of the stack. We need to reverse them and store starting at the first argument
+            StackEntry[] argumentValues = new StackEntry[parameterCount];
+            for (int i = 0; i < argumentValues.Length; i++)
+            {
+                argumentValues[argumentValues.Length - i - 1] = _stack.Pop();
+            }
+            LoadExpressionEntry returnValue = HandleCall(callee, signature, argumentValues, opcode, calliTarget);
+            if (returnValue != null)
+            {
+                _stack.Push(returnValue);
+            }
+        }
+
+        private LoadExpressionEntry HandleCall(MethodDesc callee, MethodSignature signature, StackEntry[] argumentValues, ILOpcode opcode = ILOpcode.call, LLVMValueRef calliTarget = default(LLVMValueRef), TypeDesc forcedReturnType = null)
         {
             if (opcode == ILOpcode.callvirt && callee.IsVirtual)
             {
@@ -990,8 +1010,9 @@ namespace Internal.IL
             {
                 AddMethodReference(callee);
             }
-
-            int offset = GetTotalParameterOffset() + GetTotalLocalOffset() + signature.ReturnType.GetElementSize().AsInt;
+            var pointerSize = _compilation.NodeFactory.Target.PointerSize;
+            int offset = GetTotalParameterOffset() + GetTotalLocalOffset() + 
+                signature.ReturnType.GetElementSize().AsInt.AlignUp(pointerSize);
 
             LLVMValueRef shadowStack = LLVM.BuildGEP(_builder, LLVM.GetFirstParam(_llvmFunction),
                 new LLVMValueRef[] { LLVM.ConstInt(LLVM.Int32Type(), (uint)offset, LLVMMisc.False) },
@@ -1006,20 +1027,7 @@ namespace Internal.IL
 
             // argument offset
             uint argOffset = 0;
-            int instanceAdjustment = 0;
-            if (!signature.IsStatic)
-            {
-                instanceAdjustment = 1;
-            }
-
-            // The last argument is the top of the stack. We need to reverse them and store starting at the first argument
-            StackEntry[] argumentValues = new StackEntry[signature.Length + instanceAdjustment];
-
-            for(int i = 0; i < argumentValues.Length; i++)
-            {
-                argumentValues[argumentValues.Length - i - 1] = _stack.Pop();
-            }
-
+            var instanceAdjustment = signature.IsStatic ? 0 : 1;
             for (int index = 0; index < argumentValues.Length; index++)
             {
                 StackEntry toStore = argumentValues[index];
@@ -1043,7 +1051,7 @@ namespace Internal.IL
 
                 ImportStoreHelper(toStore.ValueAsType(valueType, _builder), valueType, castShadowStack, argOffset);
 
-                argOffset += (uint)argType.GetElementSize().AsInt;
+                argOffset += (uint)argType.GetElementSize().AsInt.AlignUp(pointerSize);
             }
 
             LLVMValueRef fn;
@@ -1060,11 +1068,15 @@ namespace Internal.IL
                 castShadowStack,
                 castReturnAddress}, string.Empty);
 
-            
+
             if (!signature.ReturnType.IsVoid)
             {
                 var returnType = forcedReturnType ?? signature.ReturnType;
-                PushLoadExpression(GetStackValueKind(returnType), String.Empty, returnAddress, returnType);
+                return new LoadExpressionEntry(GetStackValueKind(returnType), String.Empty, returnAddress, returnType);
+            }
+            else
+            {
+                return null;
             }
         }
 
@@ -1693,24 +1705,26 @@ namespace Internal.IL
             TypeDesc type = ResolveTypeToken(token);
             LLVMValueRef eeType = GetEETypePointerForTypeDesc(type, true);
             var eeTypeDesc = _compilation.TypeSystemContext.SystemModule.GetKnownType("System", "EETypePtr");
-
+            StackEntry boxedObject = _stack.Pop();
             if (opCode == ILOpcode.unbox)
             {
                 if (type.IsNullable)
                     throw new NotImplementedException();
 
-                var unboxTarget = _stack.Pop();
-                PushLoadExpression(StackValueKind.ByRef, "eeType", eeType, eeTypeDesc);
-                _stack.Push(unboxTarget);
-                CallRuntimeExport(_compilation.TypeSystemContext, "RhUnbox2");
+                var arguments = new StackEntry[] { new LoadExpressionEntry(StackValueKind.ByRef, "eeType", eeType, eeTypeDesc), boxedObject };
+                PushNonNull(CallRuntime(_compilation.TypeSystemContext, RuntimeExport, "RhUnbox2", arguments));
             }
             else //unbox_any
             {
                 Debug.Assert(opCode == ILOpcode.unbox_any);
                 LLVMValueRef untypedObjectValue = LLVM.BuildAlloca(_builder, GetLLVMTypeForTypeDesc(type), "objptr");
-                PushExpression(StackValueKind.ByRef, "objPtr", untypedObjectValue, type.MakePointerType());
-                PushLoadExpression(StackValueKind.ByRef, "eeType", eeType, eeTypeDesc);
-                CallRuntimeExport(_compilation.TypeSystemContext, "RhUnboxAny");
+                var arguments = new StackEntry[]
+                {
+                    boxedObject,
+                    new ExpressionEntry(StackValueKind.ByRef, "objPtr", untypedObjectValue, type.MakePointerType()),
+                    new LoadExpressionEntry(StackValueKind.ByRef, "eeType", eeType, eeTypeDesc)
+                };
+                CallRuntime(_compilation.TypeSystemContext, RuntimeExport, "RhUnboxAny", arguments);
                 PushLoadExpression(GetStackValueKind(type), "unboxed", untypedObjectValue, type);
             }
         }
@@ -1939,9 +1953,18 @@ namespace Internal.IL
             TypeDesc type = ResolveTypeToken(token);
             LLVMValueRef eeType = GetEETypePointerForTypeDesc(type, true);
             var eeTypeDesc = _compilation.TypeSystemContext.SystemModule.GetKnownType("System", "EETypePtr");
-            _stack.Push(TakeAddressOf(_stack.Pop()));
-            PushLoadExpression(StackValueKind.ValueType, "eeType", eeType, eeTypeDesc.MakePointerType());
-            CallRuntimeExport(_compilation.TypeSystemContext, "RhBoxAny");
+            var valueAddress = TakeAddressOf(_stack.Pop());
+            var eeTypeEntry = new LoadExpressionEntry(StackValueKind.ValueType, "eeType", eeType, eeTypeDesc.MakePointerType());
+            if (type.IsValueType)
+            {
+                var arguments = new StackEntry[] { eeTypeEntry, valueAddress };
+                PushNonNull(CallRuntime(_compilation.TypeSystemContext, RuntimeExport, "RhBox", arguments));
+            }
+            else
+            {
+                var arguments = new StackEntry[] { valueAddress, eeTypeEntry };
+                PushNonNull(CallRuntime(_compilation.TypeSystemContext, RuntimeExport, "RhBoxAny", arguments));
+            }
         }
 
         private void ImportLeave(BasicBlock target)
@@ -1972,9 +1995,8 @@ namespace Internal.IL
             TypeDesc arrayType = ResolveTypeToken(token).MakeArrayType();
             var sizeOfArray = _stack.Pop();
             var eeTypeDesc = _compilation.TypeSystemContext.SystemModule.GetKnownType("System", "EETypePtr");
-            PushLoadExpression(StackValueKind.ValueType, "eeType", GetEETypePointerForTypeDesc(arrayType, true), eeTypeDesc.MakePointerType());
-            _stack.Push(sizeOfArray);
-            CallRuntimeExport(_compilation.TypeSystemContext, "RhNewArray");
+            var arguments = new StackEntry[] { new LoadExpressionEntry(StackValueKind.ValueType, "eeType", GetEETypePointerForTypeDesc(arrayType, true), eeTypeDesc.MakePointerType()), sizeOfArray };
+            PushNonNull(CallRuntime(_compilation.TypeSystemContext, RuntimeExport, "RhNewArray", arguments, arrayType));
         }
 
         private LLVMValueRef ArrayBaseSize()
@@ -2030,14 +2052,15 @@ namespace Internal.IL
 
         private LLVMValueRef GetElementAddress(LLVMValueRef elementPosition, LLVMValueRef arrayReference, TypeDesc arrayElementType)
         {
-            LLVMValueRef elementOffset = LLVM.BuildMul(_builder, elementPosition, BuildConstInt32(arrayElementType.GetElementSize().AsInt), "elementOffset");
+            var pointerSize = _compilation.NodeFactory.Target.PointerSize;
+            LLVMValueRef elementOffset = LLVM.BuildMul(_builder, elementPosition, BuildConstInt32(arrayElementType.GetElementSize().AsInt.AlignUp(pointerSize)), "elementOffset");
             LLVMValueRef arrayOffset = LLVM.BuildAdd(_builder, elementOffset, ArrayBaseSize(), "arrayOffset");
             return LLVM.BuildGEP(_builder, arrayReference, new LLVMValueRef[] { arrayOffset }, "elementPointer");
         }
 
-        LLVMValueRef EmitRuntimeHelperCall(string name, LLVMValueRef[] parameters)
+        LLVMValueRef EmitRuntimeHelperCall(string name, TypeDesc returnType, LLVMValueRef[] parameters)
         {
-            var runtimeHelperSig = LLVM.FunctionType(LLVMTypeRef.PointerType(LLVMTypeRef.Int8Type(), 0), parameters.Select(valRef => LLVM.TypeOf(valRef)).ToArray(), false);
+            var runtimeHelperSig = LLVM.FunctionType(GetLLVMTypeForTypeDesc(returnType), parameters.Select(valRef => LLVM.TypeOf(valRef)).ToArray(), false);
             var runtimeHelper = GetOrCreateLLVMFunction(name, runtimeHelperSig);
             return LLVM.BuildCall(_builder, runtimeHelper, parameters, "call_" + name);
         }
@@ -2101,11 +2124,21 @@ namespace Internal.IL
 
         }
 
-        private void CallRuntimeExport(TypeSystemContext context, string methodName, TypeDesc forcedReturnType = null)
+        private const string RuntimeExport = "RuntimeExports";
+        private const string RuntimeImport = "RuntimeImports";
+        private LoadExpressionEntry CallRuntime(TypeSystemContext context, string className, string methodName, StackEntry[] arguments, TypeDesc forcedReturnType = null)
         {
-            MetadataType helperType = context.SystemModule.GetKnownType("System.Runtime", "RuntimeExports");
+            MetadataType helperType = context.SystemModule.GetKnownType("System.Runtime", className);
             MethodDesc helperMethod = helperType.GetKnownMethod(methodName, null);
-            HandleCall(helperMethod, helperMethod.Signature, forcedReturnType: forcedReturnType);
+            return HandleCall(helperMethod, helperMethod.Signature, arguments, forcedReturnType: forcedReturnType);
+        }
+
+        private void PushNonNull(StackEntry entry)
+        {
+            if (entry != null)
+            {
+                _stack.Push(entry);
+            }
         }
 
         private StackEntry NewSpillSlot(StackEntry entry)
